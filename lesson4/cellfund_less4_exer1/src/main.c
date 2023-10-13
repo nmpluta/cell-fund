@@ -13,7 +13,7 @@
 #include <modem/lte_lc.h>
 
 /* STEP 2.3 - Include the header file for the MQTT Library*/
-
+#include <zephyr/net/mqtt.h>
 
 #include "mqtt_connection.h"
 /* The mqtt client struct */
@@ -76,11 +76,23 @@ static int modem_configure(void)
 
 static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
-	switch (has_changed) {
-	case DK_BTN1_MSK:
-		/* STEP 7.2 - When button 1 is pressed, call data_publish() to publish a message */
+	switch (has_changed) 
+    {
+        case DK_BTN1_MSK:
+            /* STEP 7.2 - When button 1 is pressed, call data_publish() to publish a message */
+            if (button_state & DK_BTN1_MSK) 
+            {
+                LOG_INF("Button 1 pressed");
+                char * data = "Button 1 pressed";
 
-		break;
+                int err = data_publish(&client, MQTT_QOS_1_AT_LEAST_ONCE, data, strlen(data));
+                if (err != 0) 
+                {
+                    LOG_ERR("Failed to publish message");
+                    return;
+                }
+            }
+            break;
 	}
 }
 
