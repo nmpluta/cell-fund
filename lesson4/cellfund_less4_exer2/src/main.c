@@ -60,7 +60,11 @@ static int modem_configure(void)
 	}
 
 	/* STEP 4.3 - Store the certificate in the modem while the modem is in offline mode  */
-
+	err = certificate_provision();
+	if (err) {
+		LOG_ERR("Failed to provision certificate, error: %d", err);
+		return err;
+	}
 
 	LOG_INF("Connecting to LTE network");
 
