@@ -1,6 +1,8 @@
 # editors
 *.swp
 *~
+*.crt
+certificate.h
 
 # build
 **/build*/
