@@ -17,20 +17,20 @@
 #include <modem/lte_lc.h>
 
 /* STEP 4.2 - Include the header files for the modem key management library and TLS credentials API */
-
+#include <modem/modem_key_mgmt.h>
 
 /* STEP 5 - Define the macros for the security tag */
-
+#define DTLS_SEC_TAG 42
 
 #define MESSAGE_TO_SEND "Hello from nRF9160 SiP"
 #define APP_COAP_MAX_MSG_LEN 1280
 #define APP_COAP_VERSION 1
 
 /* STEP 9.1 - Define the interval for pinging the server */
-
+#define TX_KEEP_ALIVE_INTERVAL K_SECONDS(5)
 
 /* STEP 9.2 - Define the delayable work item */
-
+static struct k_work_delayable rx_work;
 
 static uint8_t coap_buf[APP_COAP_MAX_MSG_LEN];
 static uint16_t next_token;
@@ -87,17 +87,39 @@ static int server_resolve(void)
 static int client_init(void)
 {
 	int err;
-	/* STEP 6.1 - Create a DTLS socket */
-
+	/* STEP 6.1 - Create a DTLS socket */	
+	sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_DTLS_1_2);
 
 	/* STEP 7.1 - Set peer verification to be required */
+	enum {
+		NONE = 0,
+		OPTIONAL,
+		REQUIRED,
+	};
+	int verify = REQUIRED;
 
+	err = setsockopt(sock, SOL_TLS, TLS_PEER_VERIFY, &verify, sizeof(verify));
+	if (err < 0) {
+		LOG_ERR("Failed to set peer verification, errno %d", errno);
+		return -errno;
+	}
 
 	/* STEP 7.2 - Set the TLS hostname */
-
+	err = setsockopt(sock, SOL_TLS, TLS_HOSTNAME,
+					 CONFIG_COAP_SERVER_HOSTNAME,
+					 sizeof(CONFIG_COAP_SERVER_HOSTNAME));
+	if (err < 0) {
+		LOG_ERR("Failed to set hostname, errno %d", errno);
+		return -errno;
+	}
 
 	/* STEP 7.3 - Set the credential security tag */
-
+	nrf_sec_tag_t sec_tags = { DTLS_SEC_TAG };
+	err = setsockopt(sock, SOL_TLS, TLS_SEC_TAG_LIST, &sec_tags, sizeof(sec_tags));
+	if (err < 0) {
+		LOG_ERR("Failed to set credential security tag, errno %d", errno);
+		return -errno;
+	}
 
 	err = connect(sock, (struct sockaddr *)&server,
 		      sizeof(struct sockaddr_in));
@@ -149,9 +171,19 @@ static int modem_configure(void)
 	}
 
 	/* STEP 8.1 - Write the PSK identity to the modem*/
-
+	err = modem_key_mgmt_write((nrf_sec_tag_t)DTLS_SEC_TAG,
+							   MODEM_KEY_MGMT_CRED_TYPE_IDENTITY,
+							   CONFIG_COAP_DEVICE_NAME,
+							   strlen(CONFIG_COAP_DEVICE_NAME));
+	if (err) {
+		LOG_INF("Failed to write the PSK identity to the modem, error: %d", err);
+	}
 
 	/* STEP 8.2 - Write the PSK to the modem */
+	err = modem_key_mgmt_write((nrf_sec_tag_t)DTLS_SEC_TAG,
+							   MODEM_KEY_MGMT_CRED_TYPE_PSK,
+							   CONFIG_COAP_SERVER_PSK,
+							   strlen(CONFIG_COAP_SERVER_PSK));
 
 
 	LOG_INF("Connecting to LTE network");
@@ -322,6 +354,10 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 }
 
 /* STEP 9.3 - Define the handler for the work item */
+static void rx_work_fn(struct k_work *k_work)
+{
+	client_get_send();
+}
 
 int main(void)
 {
@@ -353,11 +389,11 @@ int main(void)
 	}
 
 	/* STEP 9.4 - Initialize the work item rx_work with the handler function */
-
+	k_work_init_delayable(&rx_work, rx_work_fn);
 
 	while (1) {
 		/* STEP 9.5 - Schedule the work item rx_work with a delay */
-
+		k_work_schedule(&rx_work, TX_KEEP_ALIVE_INTERVAL);
 
 		received = recv(sock, coap_buf, sizeof(coap_buf), 0);
 
