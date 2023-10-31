@@ -22,8 +22,14 @@ config COAP_RX_RESOURCE
 	default "validate"
 
 # STEP 2.1 - Define the PSK Identity configuration
+config COAP_DEVICE_NAME
+	string "Device resource name - this will be the device name on the CoAP server"
+	default "npluta-nrf9160"
 
 # STEP 2.2 - Define the PSK Secret configuration
+config COAP_SERVER_PSK
+	string "Server PSK"
+	default "12345678901234567890123456789012"
 
 endmenu
 
