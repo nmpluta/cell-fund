@@ -17,19 +17,20 @@
 
 
 /* STEP 2.2 - Include the header file for the CoAP library */
-
+#include <zephyr/net/coap.h>
 
 /* STEP 4.1 - Define the macro for the message from the board */
-
+#define MESSAGE_TO_SEND "Hello from the nRF9160 DK!"
 
 /* STEP 4.2 - Define the macros for the CoAP version and message length */
-
+#define COAP_VERSION 1
+#define MESSAGE_LEN  1280
 
 /* STEP 5 - Declare the buffer coap_buf to receive the response. */
-
+static uint8_t coap_buf[MESSAGE_LEN];
 
 /* STEP 6.1 - Define the CoAP message token next_token */
-
+static uint16_t next_token;
 
 static int sock;
 static struct sockaddr_storage server;
@@ -99,7 +100,7 @@ static int client_init(void)
 	LOG_INF("Successfully connected to server");
 
 	/* STEP 6.2 - Generate a random token after the socket is connected */
-
+	next_token = sys_rand32_get();
 
 	return 0;
 }
@@ -133,7 +134,7 @@ static int modem_configure(void)
 	LOG_INF("Initializing modem library");
 
 	err = nrf_modem_lib_init();
-	if (err) {
+	if (err < 0) {
 		LOG_ERR("Failed to initialize the modem library, error: %d", err);
 		return err;
 	}
@@ -141,7 +142,7 @@ static int modem_configure(void)
 	LOG_INF("Connecting to LTE network");
 
 	err = lte_lc_init_and_connect_async(lte_handler);
-	if (err) {
+	if (err < 0) {
 		LOG_INF("Modem could not be configured, error: %d", err);
 		return err;
 	}
@@ -156,13 +157,41 @@ static int modem_configure(void)
 /**@biref Send CoAP GET request. */
 static int client_get_send(void)
 {
-	/* STEP 7.1 - Create the CoAP message*/
+	int err;
 
+	/* STEP 7.1 - Create the CoAP message*/
+	struct coap_packet request;
+	
+	/* Increment the token for each request */
+	next_token++;
+
+	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf),
+						   COAP_VERSION, COAP_TYPE_NON_CON,
+						   sizeof(next_token),
+						   (uint8_t *)&next_token,
+						   COAP_METHOD_GET, coap_next_id());
+	if (err < 0) {
+		LOG_ERR("Failed to initialize CoAP message, error: %d\n", err);
+		return err;
+	}
 
 	/* STEP 7.2 - Add an option specifying the resource path */
-
+	err = coap_packet_append_option(&request, COAP_OPTION_URI_PATH,
+									(uint8_t *)CONFIG_COAP_RX_RESOURCE,
+									strlen(CONFIG_COAP_RX_RESOURCE));
+	if (err < 0) {
+		LOG_ERR("Unable to add option %d, error: %d", COAP_OPTION_URI_PATH, err);
+		return err;
+	}
 
 	/* STEP 7.3 - Send the configured CoAP packet */
+	err = send(sock, request.data, request.offset, 0);
+	if (err < 0) {
+		LOG_ERR("Failed to send CoAP request, error: %d\n", err);
+		return err;
+	}
+
+	LOG_INF("CoAP GET request sent: Token 0x%04x\n", next_token);
 
 	return 0;
 }
@@ -176,12 +205,46 @@ static int client_put_send(void)
 	next_token++;
 
 	/* STEP 8.1 - Initialize the CoAP packet and append the resource path */
+	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf),
+						   COAP_VERSION, COAP_TYPE_NON_CON,
+						   sizeof(next_token), (uint8_t *)&next_token,
+						   COAP_METHOD_PUT, coap_next_id());
+	if (err < 0) {
+		LOG_ERR("Failed to initialize CoAP message, error: %d\n", err);
+		return err;
+	}
 
+	/* Append the resource path. */
+	err = coap_packet_append_option(&request, COAP_OPTION_URI_PATH,
+									(uint8_t *)CONFIG_COAP_TX_RESOURCE,
+									strlen(CONFIG_COAP_TX_RESOURCE));
+	if (err < 0) {
+		LOG_ERR("Unable to add option %d, error: %d", COAP_OPTION_CONTENT_FORMAT, err);
+		return err;
+	}
 
 	/* STEP 8.2 - Append the content format as plain text */
+	const uint8_t text_plain = COAP_CONTENT_FORMAT_TEXT_PLAIN;
+	err = coap_packet_append_option(&request, COAP_OPTION_CONTENT_FORMAT,
+									&text_plain,
+									sizeof(text_plain));
+	if (err < 0) {
+		LOG_ERR("Unable to add option %d, error: %d", COAP_OPTION_CONTENT_FORMAT, err);
+		return err;
+	}
 
 	/* STEP 8.3 - Add the payload to the message */
+	err = coap_packet_append_payload_marker(&request);
+	if (err < 0) {
+		LOG_ERR("Unable to add payload marker, error: %d", err);
+		return err;
+	}
 
+	err = coap_packet_append_payload(&request, (uint8_t *)MESSAGE_TO_SEND, sizeof(MESSAGE_TO_SEND));
+	if (err < 0) {
+		LOG_ERR("Unable to add payload, error: %d", err);
+		return err;
+	}
 
 	err = send(sock, request.data, request.offset, 0);
 	if (err < 0) {
@@ -203,16 +266,46 @@ static int client_handle_response(uint8_t *buf, int received)
 	const uint8_t *payload;
 	uint16_t payload_len;
 	uint8_t temp_buf[128];
-	/* STEP 9.1 - Parse the received CoAP packet */
+	int err;
 
+	/* STEP 9.1 - Parse the received CoAP packet */
+	err = coap_packet_parse(&reply, buf, received, NULL, 0);
+	if (err < 0) {
+		LOG_ERR("Invalid data received, error: %d\n", err);
+		return err;
+	}
 
 	/* STEP 9.2 - Confirm the token in the response matches the token sent */
-
+	token_len = coap_header_get_token(&reply, token);
+	if ((token_len != sizeof(next_token)) ||
+		(memcmp(&next_token, token, sizeof(next_token)) != 0))
+	{
+		LOG_ERR("Invalid token received 0x%02x%02x\n",
+				token[1], token[0]);
+		return -EINVAL;
+	}
+	else if (token_len == 0)
+	{
+		LOG_ERR("Token max length (COAP_TOKEN_MAX_LEN) is exceeded.");
+		return -EINVAL;
+	}
 
 	/* STEP 9.3 - Retrieve the payload and confirm it's nonzero */
+	payload = coap_packet_get_payload(&reply, &payload_len);
 
+	if (payload_len > 0)
+	{
+		snprintf(temp_buf, MIN(payload_len + 1, sizeof(temp_buf)), "%s", payload);
+		LOG_INF("CoAP response received: %s\n", (char *)temp_buf);
+	}
+	else
+	{
+		strcpy(temp_buf, "EMPTY");
+	}
 
 	/* STEP 9.4 - Log the header code, token and payload of the response */
+	LOG_INF("CoAP response received: Code 0x%x, Token 0x%02x%02x, Payload %s\n",
+			coap_header_get_code(&reply), token[0], token[1], (char *)temp_buf);
 
 	return 0;
 }
@@ -220,7 +313,16 @@ static int client_handle_response(uint8_t *buf, int received)
 static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
 	/* STEP 10 - Send a GET request or PUT request upon button triggers */
-
+	if (has_changed & button_state & DK_BTN1_MSK) {
+		LOG_INF("Button 1 pressed");
+		LOG_INF("Sending CoAP GET request");
+		client_get_send();
+	}
+	else if (has_changed & button_state & DK_BTN2_MSK) {
+		LOG_INF("Button 2 pressed");
+		LOG_INF("Sending CoAP PUT request");
+		client_put_send();
+	}
 }
 
 int main(void)
@@ -233,7 +335,7 @@ int main(void)
 	}
 
 	err = modem_configure();
-	if (err) {
+	if (err < 0) {
 		LOG_ERR("Failed to configure the modem");
 		return 0;
 	}
@@ -252,11 +354,28 @@ int main(void)
 		return 0;
 	}
 
-	while (1) {
+	while (1)
+	{
 		/* STEP 11 - Receive response from the CoAP server */
-
+		received = recv(sock, coap_buf, sizeof(coap_buf), 0);
+		if (received < 0)
+		{
+			LOG_ERR("Failed to receive CoAP response");
+			break;
+		}
+		else if (received == 0)
+		{
+			LOG_INF("Empty CoAP response received");
+			continue;
+		}
 
 		/* STEP 12 - Parse the received CoAP packet */
+		err = client_handle_response(coap_buf, received);
+		if (err < 0)
+		{
+			LOG_ERR("Failed to handle CoAP response");
+			break;
+		}
 
 	}
 
