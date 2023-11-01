@@ -19,13 +19,19 @@
 #define MESSAGE_SIZE 256
 #define MESSAGE_TO_SEND "Hello"
 
-static struct nrf_modem_gnss_pvt_data_frame pvt_data;
+static struct nrf_modem_gnss_pvt_data_frame pvt_data_frame;
 
-static int64_t gnss_start_time;
-static bool first_fix = false;
+/** @brief The variable `ttff_start_time` is used to store the start time 
+  * of the Time to First Fix (TTFF) process. TTFF is the time it takes for 
+  * a GNSS receiver to acquire satellite signals and calculate a position fix. */
+static int64_t ttff_start_time;
+
+/** @brief This variable is used to keep track of whether the first fix 
+  * has been obtained during the Time to First Fix (TTFF) process. */
+static bool ttff_first_fix = false;
 
 /* STEP 3.1 - Declare buffer to send data in */
-
+static uint8_t gps_data[MESSAGE_SIZE];
 
 static int sock;
 static struct sockaddr_storage server;
@@ -93,28 +99,48 @@ static int server_connect(void)
 
 static void lte_handler(const struct lte_lc_evt *const evt)
 {
-	switch (evt->type) {
-	case LTE_LC_EVT_NW_REG_STATUS:
-		if ((evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_HOME) &&
-			(evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_ROAMING)) {
+	switch (evt->type)
+	{
+		case LTE_LC_EVT_NW_REG_STATUS:
+			if ((evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_HOME) &&
+				(evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_ROAMING)) {
+				break;
+			}
+			LOG_INF("Network registration status: %s",
+					evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ?
+					"Connected - home network" : "Connected - roaming");
+			k_sem_give(&lte_connected);
 			break;
-		}
-		LOG_INF("Network registration status: %s",
-				evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ?
-				"Connected - home network" : "Connected - roaming");
-		k_sem_give(&lte_connected);
-		break;
-	case LTE_LC_EVT_RRC_UPDATE:
-		LOG_INF("RRC mode: %s",
-				evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ?
-				"Connected" : "Idle");
-		break;
-	/* STEP 9.1 - On event PSM update, print PSM paramters and check if was enabled */
+		case LTE_LC_EVT_RRC_UPDATE:
+			LOG_INF("RRC mode: %s",
+					evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ?
+					"Connected" : "Idle");
+			break;
 
-	/* STEP 9.2 - On event eDRX update, print eDRX paramters */
+		/* STEP 9.1 - On event PSM update, print PSM paramters and check if was enabled */
+		case LTE_LC_EVT_PSM_UPDATE:
+			LOG_INF("PSM parameter update: TAU: %d s, Active time: %d s",
+					evt->psm_cfg.tau, evt->psm_cfg.active_time);
+			
+			if (evt->psm_cfg.active_time == -1)
+			{
+				LOG_ERR("Network rejected PSM request");
+			}
+			break;
 
-	default:
-		break;
+		/* STEP 9.2 - On event eDRX update, print eDRX paramters */
+		case LTE_LC_EVT_EDRX_UPDATE:
+			LOG_INF("eDRX parameter update: eDRX: %d, PTW: %d",
+					evt->edrx_cfg.edrx, evt->edrx_cfg.ptw);
+			
+			if (evt->edrx_cfg.edrx == -1)
+			{
+				LOG_ERR("Network rejected eDRX request");
+			}
+			break;
+
+		default:
+			break;
 	}
 }
 
@@ -131,7 +157,18 @@ static int modem_configure(void)
 	}
 
 	/* STEP 8 - Request PSM and eDRX from the network */
+	err = lte_lc_psm_req(true);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to request PSM from the network, error: %d", err);
+		return err;
+	}
 
+	err = lte_lc_edrx_req(true);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to request eDRX from the network, error: %d", err);
+	}
 
 	LOG_INF("Connecting to LTE network");
 
@@ -148,68 +185,115 @@ static int modem_configure(void)
 	return 0;
 }
 
-static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame *pvt_data)
+static void print_fix_data(struct nrf_modem_gnss_pvt_data_frame * p_pvt_data_frame)
 {
-	LOG_INF("Latitude:       %.06f", pvt_data->latitude);
-	LOG_INF("Longitude:      %.06f", pvt_data->longitude);
-	LOG_INF("Altitude:       %.01f m", pvt_data->altitude);
-	LOG_INF("Time (UTC):     %02u:%02u:%02u.%03u",
-	       pvt_data->datetime.hour,
-	       pvt_data->datetime.minute,
-	       pvt_data->datetime.seconds,
-	       pvt_data->datetime.ms);
+	LOG_INF("Time (UTC):	%02d:%02d:%02d",
+			p_pvt_data_frame->datetime.year,
+			p_pvt_data_frame->datetime.month,
+			p_pvt_data_frame->datetime.day);
+	LOG_INF("Latitude:		%.4f", p_pvt_data_frame->latitude);
+	LOG_INF("Longitude:		%.4f", p_pvt_data_frame->longitude);
+	LOG_INF("Altitude:		%.1f m", p_pvt_data_frame->altitude);
 
 	/* STEP 3.2 - Store latitude and longitude in gps_data buffer */
-
+	int err = snprintf(gps_data, MESSAGE_SIZE, "Latitude: %.4f, Longitude: %.4f, Altitude: %.1f m",
+					   p_pvt_data_frame->latitude,
+					   p_pvt_data_frame->longitude,
+					   p_pvt_data_frame->altitude);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to store latitude and longitude in gps_data buffer");
+	}
 }
 
 static void gnss_event_handler(int event)
 {
-	int err, num_satellites;
+	int err;
 
-	switch (event) {
-	case NRF_MODEM_GNSS_EVT_PVT:
-		num_satellites = 0;
-		for (int i = 0; i < 12 ; i++) {
-			if (pvt_data.sv[i].signal != 0) {
-				num_satellites++;
+	switch (event)
+	{
+		case NRF_MODEM_GNSS_EVT_PVT:
+			LOG_INF("Searching...");
+
+			/* STEP 15 - Print satellite information */
+			int num_satellites = 0;
+			for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES ; i++)
+			{
+				// Check if the satellite is in view and has a valid signal
+				if (pvt_data_frame.sv[i].signal > 0)
+				{
+					num_satellites++;
+					LOG_INF("SV ID: %3d, singal type: %3d, SNR: %3d db/Hz, flags: USED_IN_FIX: %s | UNHEALTHY: %s",
+							pvt_data_frame.sv[i].sv,
+							pvt_data_frame.sv[i].signal,
+							pvt_data_frame.sv[i].cn0/10,
+							pvt_data_frame.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_USED_IN_FIX ? "true " : "false",
+							pvt_data_frame.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_UNHEALTHY ? "true " : "false");
+				}
 			}
-		}
-		LOG_INF("Searching. Current satellites: %d", num_satellites);
-		err = nrf_modem_gnss_read(&pvt_data, sizeof(pvt_data), NRF_MODEM_GNSS_DATA_PVT);
-		if (err) {
-			LOG_ERR("nrf_modem_gnss_read failed, err %d", err);
-			return;
-		}
-		if (pvt_data.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID) {
-			dk_set_led_on(DK_LED1);
-			print_fix_data(&pvt_data);
-			if (!first_fix) {
-				LOG_INF("Time to first fix: %2.1lld s", (k_uptime_get() - gnss_start_time)/1000);
-				first_fix = true;
+			LOG_INF("Numbers of satellites in view: %d", num_satellites);
+
+			err = nrf_modem_gnss_read(&pvt_data_frame,
+									  sizeof(pvt_data_frame),
+									  NRF_MODEM_GNSS_DATA_PVT);
+			if (err < 0)
+			{
+				LOG_INF("Failed to read GNSS data, error: %d", err);
+				return;
 			}
-			return;
-		}
-		/* STEP 5 - Check for the flags indicating GNSS is blocked */
 
-		break;
+			if (pvt_data_frame.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID)
+			{
+				if(!ttff_first_fix)
+				{
+					/* STEP 12.3 - Log the TTFF */
+					dk_set_led_on(DK_LED1);
+					LOG_INF("Time to first fix (TTFF): %2.2lld seconds",
+							(k_uptime_get() - ttff_start_time) / 1000);
+					ttff_first_fix = true;
+				}
+				LOG_INF("Valid fix");
+				print_fix_data(&pvt_data_frame);
+				return;
+			}
+			else
+			{
+				LOG_INF("No valid fix, error: %d", pvt_data_frame.flags);
+			}
 
-	case NRF_MODEM_GNSS_EVT_PERIODIC_WAKEUP:
-		LOG_INF("GNSS has woken up");
-		break;
-	case NRF_MODEM_GNSS_EVT_SLEEP_AFTER_FIX:
-		LOG_INF("GNSS enter sleep after fix");
-		break;
-	default:
-		break;
+			/* STEP 5 - Check for the flags indicating GNSS is blocked */
+			if (pvt_data_frame.flags & NRF_MODEM_GNSS_PVT_FLAG_DEADLINE_MISSED) {
+				LOG_INF("GNSS is blocked and missed the deadline due to LTE activity");
+			}
+
+			if (pvt_data_frame.flags & NRF_MODEM_GNSS_PVT_FLAG_NOT_ENOUGH_WINDOW_TIME) {
+				LOG_INF("GNSS received too short window time to get a fix");
+			}
+			break;
+
+		case NRF_MODEM_GNSS_EVT_PERIODIC_WAKEUP:
+			LOG_INF("GNSS wakeup in periodic mode");
+			break;
+		
+		case NRF_MODEM_GNSS_EVT_SLEEP_AFTER_FIX:
+			LOG_INF("GNSS sleep after fix in periodic mode");
+			break;
+
+		default:
+			break;
 	}
+	/* Empty log for readability */
+	LOG_INF("");
 }
 
 static int gnss_init_and_start(void)
 {
-
 	/* STEP 4 - Set the modem mode to normal */
-
+	if (lte_lc_func_mode_set(LTE_LC_FUNC_MODE_NORMAL) < 0)
+	{
+		LOG_ERR("Failed to set the modem to fully functional mode (LTE+GNSS)");
+		return -1;
+	}
 
 	if (nrf_modem_gnss_event_handler_set(gnss_event_handler) != 0) {
 		LOG_ERR("Failed to set GNSS event handler");
@@ -232,15 +316,38 @@ static int gnss_init_and_start(void)
 		return -1;
 	}
 
-	gnss_start_time = k_uptime_get();
+	/* Enabling GNSS over LTE idle mode procedues is required if setting PSM or eDRX
+	 * does not work (if it works enabling priority can be commented out).
+	 * Priority will be disabled after the first fix is obtained. */
+	int err = nrf_modem_gnss_prio_mode_enable();
+	if (err != 0) {
+		LOG_ERR("Failed to set priority mode for GNSS, error: %d", err);
+	}
+	else {
+		LOG_INF("GNSS priority mode set");
+	}
+
+	ttff_start_time = k_uptime_get();
 
 	return 0;
 }
 
 static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
+	int err;
 	/* STEP 3.3 - Upon button 1 push, send gps_data */
+	switch (has_changed)
+	{
+	case DK_BTN1_MSK:
+		err = send(sock, &gps_data, sizeof(gps_data), 0);
+		if (err < 0) {
+			LOG_ERR("Failed to send data to server: %d", errno);
+		}
+		break;
 
+	default:
+		break;
+	}
 }
 
 int main(void)
